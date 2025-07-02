@@ -1,0 +1,2 @@
+# FileScanner 插件依赖
+# 目前插件使用的都是 MoviePilot 内置的模块，不需要额外依赖
