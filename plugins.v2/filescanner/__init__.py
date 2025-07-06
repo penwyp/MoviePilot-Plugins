@@ -28,7 +28,7 @@ class FileScanner(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/penwyp/MoviePilot-Plugins/main/icons/Filerun_A.png"
     # 插件版本
-    plugin_version = "2.6"
+    plugin_version = "2.5"
     # 插件作者
     plugin_author = "penwyp"
     # 作者主页
@@ -115,8 +115,8 @@ class FileScanner(_PluginBase):
                 "endpoint": self.downloader_tasks_api,
                 "methods": ["GET"],
                 "auth": "apikey",
-                "summary": "获取下载器任务列表",
-                "description": "获取所有下载器的当前下载任务"
+                "summary": "获取下载任务列表",
+                "description": "获取下载任务列表，支持状态过滤和分页。参数：status(all/downloading/completed), page(页码), count(每页数量)"
             }
         ]
 
@@ -1207,29 +1207,132 @@ function executeAllTasks() {
                 "message": error_msg
             }
 
-    def downloader_tasks_api(self):
+    def downloader_tasks_api(self, status: str = "all", page: int = 1, count: int = 30):
         """
-        获取所有下载器的当前任务
+        获取下载任务列表（支持不同状态）
+        :param status: 任务状态 - "all"(全部), "downloading"(下载中), "completed"(已完成)
+        :param page: 页码
+        :param count: 每页数量
         :return: 下载任务列表
         """
         try:
-            from app.chain.download import DownloadChain
-            download_chain = DownloadChain()
-            tasks = download_chain.downloading()  # 获取所有下载中的任务
+            all_tasks = []
             
-            # 转换为字典列表
+            # 获取当前下载中的任务
+            if status in ["all", "downloading"]:
+                try:
+                    from app.chain.download import DownloadChain
+                    download_chain = DownloadChain()
+                    downloading_tasks = download_chain.downloading()
+                    
+                    if downloading_tasks:
+                        for task in downloading_tasks:
+                            task_dict = task.dict()
+                            task_dict["status"] = "downloading"
+                            task_dict["status_text"] = "下载中"
+                            all_tasks.append(task_dict)
+                            
+                except Exception as e:
+                    logger.warning(f"获取下载中任务失败: {str(e)}")
+            
+            # 获取历史下载记录
+            if status in ["all", "completed"]:
+                try:
+                    from app.db.downloadhistory_oper import DownloadHistoryOper
+                    history_oper = DownloadHistoryOper()
+                    
+                    # 获取历史记录，按页查询
+                    history_records = history_oper.list_by_page(page=page, count=count)
+                    
+                    if history_records:
+                        # 获取当前下载中的hash列表，避免重复
+                        downloading_hashes = set()
+                        if status == "all":
+                            try:
+                                from app.chain.download import DownloadChain
+                                download_chain = DownloadChain()
+                                downloading_tasks = download_chain.downloading()
+                                if downloading_tasks:
+                                    downloading_hashes = {task.hash for task in downloading_tasks if hasattr(task, 'hash')}
+                            except:
+                                pass
+                        
+                        for record in history_records:
+                            # 跳过正在下载中的任务，避免重复
+                            if record.download_hash and record.download_hash in downloading_hashes:
+                                continue
+                                
+                            # 转换历史记录为任务格式
+                            task_dict = {
+                                "hash": record.download_hash or "",
+                                "title": record.title or "未知任务",
+                                "name": record.torrent_name or record.title or "未知任务",
+                                "progress": 100.0,  # 历史记录都是已完成的
+                                "state": "completed",
+                                "downloader": record.downloader or "未知下载器",
+                                "dlspeed": "0 B/s",
+                                "upspeed": "0 B/s", 
+                                "size": 0,
+                                "left_time": "已完成",
+                                "status": "completed",
+                                "status_text": "已完成",
+                                "date": record.date or "",
+                                "path": record.path or "",
+                                "type": record.type or "",
+                                "year": record.year or "",
+                                "seasons": record.seasons or "",
+                                "episodes": record.episodes or "",
+                                "tmdbid": record.tmdbid,
+                                "torrent_site": record.torrent_site or "",
+                                "username": record.username or "",
+                                "channel": record.channel or "",
+                                "image": record.image or "",
+                                "media": {
+                                    "title": record.title or "",
+                                    "year": record.year or "",
+                                    "type": record.type or ""
+                                } if record.title else None
+                            }
+                            all_tasks.append(task_dict)
+                            
+                except Exception as e:
+                    logger.warning(f"获取历史下载记录失败: {str(e)}")
+            
+            # 如果只要下载中的任务，不需要分页
+            if status == "downloading":
+                result_tasks = all_tasks
+            else:
+                # 分页处理
+                start_idx = (page - 1) * count
+                end_idx = start_idx + count
+                result_tasks = all_tasks[start_idx:end_idx]
+            
             return {
                 "success": True,
-                "tasks": [task.dict() for task in tasks] if tasks else [],
-                "count": len(tasks) if tasks else 0
+                "tasks": result_tasks,
+                "count": len(result_tasks),
+                "total": len(all_tasks),
+                "page": page,
+                "page_count": count,
+                "status_filter": status,
+                "status_summary": {
+                    "downloading": len([t for t in all_tasks if t.get("status") == "downloading"]),
+                    "completed": len([t for t in all_tasks if t.get("status") == "completed"]),
+                    "total": len(all_tasks)
+                }
             }
+            
         except Exception as e:
-            logger.error(f"获取下载器任务失败: {str(e)}", exc_info=True)
+            logger.error(f"获取下载任务失败: {str(e)}", exc_info=True)
             return {
                 "success": False,
                 "message": str(e),
                 "tasks": [],
-                "count": 0
+                "count": 0,
+                "total": 0,
+                "page": page,
+                "page_count": count,
+                "status_filter": status
             }
 
     def dashboard_api(self):
@@ -1727,11 +1830,38 @@ function executeAllTasks() {
         </div>
         
         <div id="downloader-tab" class="tab-content">
+            <!-- 下载任务过滤器 -->
+            <div class="download-filters" style="margin-bottom: 20px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; background: white; padding: 20px; border-radius: 15px; box-shadow: 0 5px 15px rgba(0,0,0,0.1);">
+                    <div style="display: flex; gap: 15px; align-items: center;">
+                        <label style="font-weight: bold; color: #333;">状态过滤：</label>
+                        <select id="statusFilter" onchange="filterTasks()" style="padding: 8px 15px; border: 1px solid #ddd; border-radius: 8px; background: white;">
+                            <option value="all">全部任务</option>
+                            <option value="downloading">下载中</option>
+                            <option value="completed">已完成</option>
+                        </select>
+                    </div>
+                    <div id="download-summary" style="font-size: 0.9em; color: #666;">
+                        <span id="summary-text">正在加载...</span>
+                    </div>
+                </div>
+            </div>
+            
             <div id="download-tasks-container">
                 <div class="no-downloads">
                     <p>📡 正在加载下载任务...</p>
                 </div>
             </div>
+            
+            <!-- 分页控制 -->
+            <div id="pagination-container" style="text-align: center; margin-top: 20px; display: none;">
+                <div style="display: inline-flex; gap: 10px; align-items: center; background: white; padding: 15px; border-radius: 15px; box-shadow: 0 5px 15px rgba(0,0,0,0.1);">
+                    <button id="prevPage" onclick="changePage(-1)" style="padding: 8px 15px; border: 1px solid #ddd; border-radius: 8px; background: white; cursor: pointer;">上一页</button>
+                    <span id="pageInfo" style="margin: 0 15px; color: #666;">第 1 页</span>
+                    <button id="nextPage" onclick="changePage(1)" style="padding: 8px 15px; border: 1px solid #ddd; border-radius: 8px; background: white; cursor: pointer;">下一页</button>
+                </div>
+            </div>
+            
             <div class="refresh-info">
                 <p>🔄 每10秒自动刷新</p>
             </div>
@@ -1891,12 +2021,17 @@ function executeAllTasks() {
             
             // 如果切换到下载监控，立即刷新数据
             if (tabName === 'downloader') {{
-                fetchDownloaderTasks();
+                fetchDownloaderTasks(currentStatus, currentPage);
             }}
         }}
         
+        // 全局变量跟踪当前状态和分页
+        let currentStatus = 'all';
+        let currentPage = 1;
+        let totalPages = 1;
+        
         // 获取下载任务
-        async function fetchDownloaderTasks() {{
+        async function fetchDownloaderTasks(status = 'all', page = 1) {{
             const apiKey = getApiKey();
             if (!apiKey) {{
                 document.getElementById('download-tasks-container').innerHTML = `
@@ -1908,7 +2043,8 @@ function executeAllTasks() {
             }}
             
             try {{
-                const response = await fetch(`/api/v1/plugin/FileScanner/downloader_tasks?apikey=${{apiKey}}`);
+                const url = `/api/v1/plugin/FileScanner/downloader_tasks?status=${{status}}&page=${{page}}&count=20&apikey=${{apiKey}}`;
+                const response = await fetch(url);
                 
                 if (!response.ok) {{
                     document.getElementById('download-tasks-container').innerHTML = `
@@ -1922,7 +2058,9 @@ function executeAllTasks() {
                 const data = await response.json();
                 
                 if (data && data.success) {{
-                    updateDownloaderDisplay(data.tasks || []);
+                    updateDownloaderDisplay(data);
+                    updateSummary(data.status_summary || {{}});
+                    updatePagination(data);
                 }} else {{
                     const message = (data && data.message) || '未知错误';
                     document.getElementById('download-tasks-container').innerHTML = `
@@ -1941,14 +2079,67 @@ function executeAllTasks() {
             }}
         }}
         
+        // 状态过滤
+        function filterTasks() {{
+            const statusFilter = document.getElementById('statusFilter');
+            currentStatus = statusFilter.value;
+            currentPage = 1; // 重置到第一页
+            fetchDownloaderTasks(currentStatus, currentPage);
+        }}
+        
+        // 分页切换
+        function changePage(direction) {{
+            const newPage = currentPage + direction;
+            if (newPage >= 1 && newPage <= totalPages) {{
+                currentPage = newPage;
+                fetchDownloaderTasks(currentStatus, currentPage);
+            }}
+        }}
+        
+        // 更新状态摘要
+        function updateSummary(summary) {{
+            const summaryText = document.getElementById('summary-text');
+            if (summary && typeof summary === 'object') {{
+                summaryText.textContent = `总计: ${{summary.total || 0}} | 下载中: ${{summary.downloading || 0}} | 已完成: ${{summary.completed || 0}}`;
+            }} else {{
+                summaryText.textContent = '正在加载...';
+            }}
+        }}
+        
+        // 更新分页信息
+        function updatePagination(data) {{
+            const paginationContainer = document.getElementById('pagination-container');
+            const pageInfo = document.getElementById('pageInfo');
+            const prevButton = document.getElementById('prevPage');
+            const nextButton = document.getElementById('nextPage');
+            
+            if (data.total > 20) {{ // 只有超过20条记录才显示分页
+                paginationContainer.style.display = 'block';
+                totalPages = Math.ceil(data.total / 20);
+                pageInfo.textContent = `第 ${{data.page}} 页，共 ${{totalPages}} 页 (${{data.total}} 条记录)`;
+                
+                prevButton.disabled = data.page <= 1;
+                nextButton.disabled = data.page >= totalPages;
+                
+                currentPage = data.page;
+            }} else {{
+                paginationContainer.style.display = 'none';
+                totalPages = 1;
+                currentPage = 1;
+            }}
+        }}
+        
         // 更新下载任务显示
-        function updateDownloaderDisplay(tasks) {{
+        function updateDownloaderDisplay(data) {{
             const container = document.getElementById('download-tasks-container');
+            const tasks = data.tasks || [];
             
             if (!tasks || tasks.length === 0) {{
+                const statusText = currentStatus === 'downloading' ? '下载中' : 
+                                 currentStatus === 'completed' ? '已完成' : '';
                 container.innerHTML = `
                     <div class="no-downloads">
-                        <p>📭 当前没有下载任务</p>
+                        <p>📭 当前没有${{statusText}}下载任务</p>
                     </div>
                 `;
                 return;
@@ -1958,27 +2149,40 @@ function executeAllTasks() {
             tasks.forEach(task => {{
                 const progress = task.progress || 0;
                 const title = task.title || task.name || '未知任务';
-                const dlspeed = task.dlspeed || '0 KB/s';
-                const upspeed = task.upspeed || '0 KB/s';
+                const dlspeed = task.dlspeed || '0 B/s';
+                const upspeed = task.upspeed || '0 B/s';
                 const size = formatSize(task.size || 0);
                 const leftTime = task.left_time || '计算中...';
-                const state = task.state || 'downloading';
+                const status = task.status || 'downloading';
+                const statusText = task.status_text || '未知状态';
                 const downloader = task.downloader || '未知';
                 
+                // 根据状态设置不同的样式
+                const statusColor = status === 'downloading' ? '#1976d2' : 
+                                  status === 'completed' ? '#4CAF50' : '#666';
+                const progressColor = status === 'completed' ? '#4CAF50' : '#2196F3';
+                
                 html += `
-                    <div class="download-card">
+                    <div class="download-card" style="border-left: 4px solid ${{statusColor}};">
                         <div class="download-header">
                             <div class="download-title" title="${{title}}">${{title}}</div>
-                            <div class="download-status">${{downloader}}</div>
+                            <div class="download-status" style="background: ${{statusColor}}20; color: ${{statusColor}};">
+                                ${{statusText}}
+                            </div>
                         </div>
                         
                         <div class="progress-bar">
-                            <div class="progress-fill" style="width: ${{progress}}%">
+                            <div class="progress-fill" style="width: ${{progress}}%; background: linear-gradient(45deg, ${{progressColor}}, ${{progressColor}}dd);">
                                 ${{progress.toFixed(1)}}%
                             </div>
                         </div>
                         
                         <div class="download-stats">
+                            <div class="stat-item">
+                                <div class="stat-label">下载器</div>
+                                <div class="stat-value">${{downloader}}</div>
+                            </div>
+                            ${{status === 'downloading' ? `
                             <div class="stat-item">
                                 <div class="stat-label">下载速度</div>
                                 <div class="stat-value">${{dlspeed}}</div>
@@ -1987,21 +2191,37 @@ function executeAllTasks() {
                                 <div class="stat-label">上传速度</div>
                                 <div class="stat-value">${{upspeed}}</div>
                             </div>
+                            ` : `
                             <div class="stat-item">
-                                <div class="stat-label">文件大小</div>
-                                <div class="stat-value">${{size}}</div>
+                                <div class="stat-label">完成时间</div>
+                                <div class="stat-value">${{task.date || '未知'}}</div>
                             </div>
+                            ${{task.type ? `
                             <div class="stat-item">
-                                <div class="stat-label">剩余时间</div>
-                                <div class="stat-value">${{leftTime}}</div>
+                                <div class="stat-label">类型</div>
+                                <div class="stat-value">${{task.type}}</div>
+                            </div>
+                            ` : ''}}
+                            `}}
+                            <div class="stat-item">
+                                <div class="stat-label">${{status === 'downloading' ? '剩余时间' : '文件大小'}}</div>
+                                <div class="stat-value">${{status === 'downloading' ? leftTime : size}}</div>
                             </div>
                         </div>
                         
                         ${{task.media && task.media.title ? `
                         <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #eee;">
                             <small style="color: #666;">
-                                媒体：${{task.media.title}} ${{task.media.year ? `(${{task.media.year}})` : ''}}
-                                ${{task.season_episode || ''}}
+                                📺 媒体：${{task.media.title}} ${{task.media.year ? `(${{task.media.year}})` : ''}}
+                                ${{task.seasons ? ` S${{task.seasons}}` : ''}}${{task.episodes ? `E${{task.episodes}}` : ''}}
+                            </small>
+                        </div>
+                        ` : ''}}
+                        
+                        ${{task.path && status === 'completed' ? `
+                        <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #eee;">
+                            <small style="color: #666;">
+                                📁 路径：${{task.path}}
                             </small>
                         </div>
                         ` : ''}}
@@ -2033,7 +2253,7 @@ function executeAllTasks() {
             refreshInterval = setInterval(() => {{
                 // 只有在下载监控Tab激活时才刷新
                 if (document.getElementById('downloader-tab').classList.contains('active')) {{
-                    fetchDownloaderTasks();
+                    fetchDownloaderTasks(currentStatus, currentPage);
                 }}
             }}, 10000);
         }}
