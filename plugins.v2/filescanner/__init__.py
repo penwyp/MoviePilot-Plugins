@@ -28,7 +28,7 @@ class FileScanner(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/penwyp/MoviePilot-Plugins/main/icons/Filerun_A.png"
     # 插件版本
-    plugin_version = "2.5"
+    plugin_version = "2.7"
     # 插件作者
     plugin_author = "penwyp"
     # 作者主页
@@ -1207,118 +1207,87 @@ function executeAllTasks() {
                 "message": error_msg
             }
 
-    def downloader_tasks_api(self, status: str = "all", page: int = 1, count: int = 30):
+    def downloader_tasks_api(self, status: str = "all", page: int = 1, count: int = 20):
         """
-        获取下载任务列表（支持不同状态）
+        获取下载任务列表（使用MoviePilot的TorrentStatus枚举）
         :param status: 任务状态 - "all"(全部), "downloading"(下载中), "completed"(已完成)
         :param page: 页码
         :param count: 每页数量
         :return: 下载任务列表
         """
         try:
+            from app.chain.download import DownloadChain
+            from app.schemas.types import TorrentStatus
+            from datetime import datetime
+            
+            download_chain = DownloadChain()
             all_tasks = []
             
-            # 获取当前下载中的任务
+            # 获取下载中的任务
             if status in ["all", "downloading"]:
                 try:
-                    from app.chain.download import DownloadChain
-                    download_chain = DownloadChain()
                     downloading_tasks = download_chain.downloading()
-                    
                     if downloading_tasks:
                         for task in downloading_tasks:
                             task_dict = task.dict()
                             task_dict["status"] = "downloading"
                             task_dict["status_text"] = "下载中"
+                            # 添加时间戳用于排序（下载中的任务使用当前时间）
+                            task_dict["sort_time"] = datetime.now().timestamp()
                             all_tasks.append(task_dict)
                             
                 except Exception as e:
                     logger.warning(f"获取下载中任务失败: {str(e)}")
             
-            # 获取历史下载记录
+            # 获取已完成/可转移的任务
             if status in ["all", "completed"]:
                 try:
-                    from app.db.downloadhistory_oper import DownloadHistoryOper
-                    history_oper = DownloadHistoryOper()
-                    
-                    # 获取历史记录，按页查询
-                    history_records = history_oper.list_by_page(page=page, count=count)
-                    
-                    if history_records:
-                        # 获取当前下载中的hash列表，避免重复
-                        downloading_hashes = set()
-                        if status == "all":
-                            try:
-                                from app.chain.download import DownloadChain
-                                download_chain = DownloadChain()
-                                downloading_tasks = download_chain.downloading()
-                                if downloading_tasks:
-                                    downloading_hashes = {task.hash for task in downloading_tasks if hasattr(task, 'hash')}
-                            except:
-                                pass
-                        
-                        for record in history_records:
-                            # 跳过正在下载中的任务，避免重复
-                            if record.download_hash and record.download_hash in downloading_hashes:
-                                continue
-                                
-                            # 转换历史记录为任务格式
-                            task_dict = {
-                                "hash": record.download_hash or "",
-                                "title": record.title or "未知任务",
-                                "name": record.torrent_name or record.title or "未知任务",
-                                "progress": 100.0,  # 历史记录都是已完成的
-                                "state": "completed",
-                                "downloader": record.downloader or "未知下载器",
-                                "dlspeed": "0 B/s",
-                                "upspeed": "0 B/s", 
-                                "size": 0,
-                                "left_time": "已完成",
-                                "status": "completed",
-                                "status_text": "已完成",
-                                "date": record.date or "",
-                                "path": record.path or "",
-                                "type": record.type or "",
-                                "year": record.year or "",
-                                "seasons": record.seasons or "",
-                                "episodes": record.episodes or "",
-                                "tmdbid": record.tmdbid,
-                                "torrent_site": record.torrent_site or "",
-                                "username": record.username or "",
-                                "channel": record.channel or "",
-                                "image": record.image or "",
-                                "media": {
-                                    "title": record.title or "",
-                                    "year": record.year or "",
-                                    "type": record.type or ""
-                                } if record.title else None
-                            }
+                    completed_tasks = download_chain.list_torrents(status=TorrentStatus.TRANSFER)
+                    if completed_tasks:
+                        for task in completed_tasks:
+                            task_dict = task.dict()
+                            task_dict["status"] = "completed"
+                            task_dict["status_text"] = "已完成"
+                            task_dict["progress"] = 100.0  # 已完成的任务进度为100%
+                            task_dict["dlspeed"] = "0 B/s"
+                            task_dict["left_time"] = "已完成"
+                            # 添加时间戳用于排序（使用任务的完成时间或当前时间）
+                            task_dict["sort_time"] = getattr(task, 'completion_on', datetime.now().timestamp())
                             all_tasks.append(task_dict)
                             
                 except Exception as e:
-                    logger.warning(f"获取历史下载记录失败: {str(e)}")
+                    logger.warning(f"获取已完成任务失败: {str(e)}")
             
-            # 如果只要下载中的任务，不需要分页
-            if status == "downloading":
-                result_tasks = all_tasks
-            else:
-                # 分页处理
-                start_idx = (page - 1) * count
-                end_idx = start_idx + count
-                result_tasks = all_tasks[start_idx:end_idx]
+            # 按时间倒序排序（最新的在前面）
+            all_tasks.sort(key=lambda x: x.get("sort_time", 0), reverse=True)
+            
+            # 计算分页
+            total_count = len(all_tasks)
+            start_idx = (page - 1) * count
+            end_idx = start_idx + count
+            result_tasks = all_tasks[start_idx:end_idx]
+            
+            # 移除排序用的时间戳字段
+            for task in result_tasks:
+                task.pop("sort_time", None)
+            
+            # 计算状态统计
+            downloading_count = len([t for t in all_tasks if t.get("status") == "downloading"])
+            completed_count = len([t for t in all_tasks if t.get("status") == "completed"])
             
             return {
                 "success": True,
                 "tasks": result_tasks,
                 "count": len(result_tasks),
-                "total": len(all_tasks),
+                "total": total_count,
                 "page": page,
                 "page_count": count,
+                "total_pages": (total_count + count - 1) // count,  # 计算总页数
                 "status_filter": status,
                 "status_summary": {
-                    "downloading": len([t for t in all_tasks if t.get("status") == "downloading"]),
-                    "completed": len([t for t in all_tasks if t.get("status") == "completed"]),
-                    "total": len(all_tasks)
+                    "downloading": downloading_count,
+                    "completed": completed_count,
+                    "total": total_count
                 }
             }
             
@@ -1332,7 +1301,13 @@ function executeAllTasks() {
                 "total": 0,
                 "page": page,
                 "page_count": count,
-                "status_filter": status
+                "total_pages": 0,
+                "status_filter": status,
+                "status_summary": {
+                    "downloading": 0,
+                    "completed": 0,
+                    "total": 0
+                }
             }
 
     def dashboard_api(self):
@@ -2113,9 +2088,9 @@ function executeAllTasks() {
             const prevButton = document.getElementById('prevPage');
             const nextButton = document.getElementById('nextPage');
             
-            if (data.total > 20) {{ // 只有超过20条记录才显示分页
+            if (data.total > data.page_count) {{ // 只有超过每页数量才显示分页
                 paginationContainer.style.display = 'block';
-                totalPages = Math.ceil(data.total / 20);
+                totalPages = data.total_pages || Math.ceil(data.total / data.page_count);
                 pageInfo.textContent = `第 ${{data.page}} 页，共 ${{totalPages}} 页 (${{data.total}} 条记录)`;
                 
                 prevButton.disabled = data.page <= 1;
@@ -2191,29 +2166,30 @@ function executeAllTasks() {
                                 <div class="stat-label">上传速度</div>
                                 <div class="stat-value">${{upspeed}}</div>
                             </div>
+                            <div class="stat-item">
+                                <div class="stat-label">剩余时间</div>
+                                <div class="stat-value">${{leftTime}}</div>
+                            </div>
                             ` : `
                             <div class="stat-item">
-                                <div class="stat-label">完成时间</div>
-                                <div class="stat-value">${{task.date || '未知'}}</div>
+                                <div class="stat-label">文件大小</div>
+                                <div class="stat-value">${{formatSize(task.size || 0)}}</div>
                             </div>
-                            ${{task.type ? `
                             <div class="stat-item">
-                                <div class="stat-label">类型</div>
-                                <div class="stat-value">${{task.type}}</div>
+                                <div class="stat-label">上传速度</div>
+                                <div class="stat-value">${{upspeed}}</div>
                             </div>
-                            ` : ''}}
+                            <div class="stat-item">
+                                <div class="stat-label">做种状态</div>
+                                <div class="stat-value">已完成</div>
+                            </div>
                             `}}
-                            <div class="stat-item">
-                                <div class="stat-label">${{status === 'downloading' ? '剩余时间' : '文件大小'}}</div>
-                                <div class="stat-value">${{status === 'downloading' ? leftTime : size}}</div>
-                            </div>
                         </div>
                         
-                        ${{task.media && task.media.title ? `
+                        ${{task.title && task.title !== task.name ? `
                         <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #eee;">
                             <small style="color: #666;">
-                                📺 媒体：${{task.media.title}} ${{task.media.year ? `(${{task.media.year}})` : ''}}
-                                ${{task.seasons ? ` S${{task.seasons}}` : ''}}${{task.episodes ? `E${{task.episodes}}` : ''}}
+                                📄 种子：${{task.name || '未知'}}
                             </small>
                         </div>
                         ` : ''}}
@@ -2222,6 +2198,14 @@ function executeAllTasks() {
                         <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #eee;">
                             <small style="color: #666;">
                                 📁 路径：${{task.path}}
+                            </small>
+                        </div>
+                        ` : ''}}
+                        
+                        ${{task.hash ? `
+                        <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #eee;">
+                            <small style="color: #888; font-family: monospace; font-size: 0.8em;">
+                                🔗 Hash: ${{task.hash.substring(0, 16)}}...
                             </small>
                         </div>
                         ` : ''}}
