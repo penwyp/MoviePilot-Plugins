@@ -28,7 +28,7 @@ class FileScanner(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/penwyp/MoviePilot-Plugins/main/icons/Filerun_A.png"
     # 插件版本
-    plugin_version = "2.7"
+    plugin_version = "3.0"
     # 插件作者
     plugin_author = "penwyp"
     # 作者主页
@@ -662,10 +662,14 @@ function executeAllTasks() {
         
         return services
 
-    def scan_and_transfer_single_task(self, task_index: int):
+    def scan_and_transfer_single_task(self, task_index: int = None, **kwargs):
         """
         执行单个扫描整理任务
         """
+        if task_index is None:
+            logger.error("文件扫描整理：task_index 参数不能为空")
+            return
+            
         if not self._enabled:
             return
             
