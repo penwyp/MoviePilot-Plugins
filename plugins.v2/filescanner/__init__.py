@@ -28,7 +28,7 @@ class FileScanner(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/penwyp/MoviePilot-Plugins/main/icons/Filerun_A.png"
     # 插件版本
-    plugin_version = "3.0"
+    plugin_version = "3.1"
     # 插件作者
     plugin_author = "penwyp"
     # 作者主页
@@ -1850,11 +1850,48 @@ function executeAllTasks() {
     <div id="resultMessage" class="result-message"></div>
     
     <script>
-        // 获取 API Key
+        // 获取 API Key - 增强Safari兼容性
         function getApiKey() {{
-            return localStorage.getItem('filescanner_api_key') || 
-                   localStorage.getItem('api_token') || 
-                   sessionStorage.getItem('api_token');
+            try {{
+                // 保持原有逻辑，添加Safari特殊处理
+                return localStorage.getItem('filescanner_api_key') || 
+                       localStorage.getItem('api_token') || 
+                       sessionStorage.getItem('api_token') ||
+                       getSafariApiKey();
+            }} catch (e) {{
+                window.FileScanner.log('Storage access failed, trying Safari method:', e.message);
+                return getSafariApiKey();
+            }}
+        }}
+        
+        // Safari专用API Key获取方法
+        function getSafariApiKey() {{
+            try {{
+                // Safari可能需要特殊的存储访问方式
+                if (window.safari) {{
+                    // iOS Safari特殊处理
+                    const safariKey = document.cookie
+                        .split('; ')
+                        .find(row => row.startsWith('api_token='))
+                        ?.split('=')[1];
+                    if (safariKey) return safariKey;
+                }}
+                
+                // 尝试从URL参数获取（手动输入的情况）
+                const urlParams = new URLSearchParams(window.location.search);
+                const urlKey = urlParams.get('apikey');
+                if (urlKey) {{
+                    // 临时保存到内存
+                    window._tempApiKey = urlKey;
+                    return urlKey;
+                }}
+                
+                // 返回临时保存的key
+                return window._tempApiKey || null;
+            }} catch (e) {{
+                window.FileScanner.log('Safari API key fallback failed:', e.message);
+                return null;
+            }}
         }}
         
         // 保存 API Key
@@ -1875,6 +1912,114 @@ function executeAllTasks() {
             document.getElementById('apiKeyField').value = getApiKey() || '';
         }}
         
+        // Safari浏览器检测
+        function isSafari() {{
+            return /^((?!chrome|android).)*safari/i.test(navigator.userAgent) || 
+                   !!window.safari ||
+                   /iPad|iPhone|iPod/.test(navigator.userAgent);
+        }}
+        
+        // 初始化渐进式事件处理
+        function initEventHandlers() {{
+            // 只在Safari或onclick不可用时替换事件处理
+            if (isSafari() || !supportsOnclick()) {{
+                window.FileScanner.log('使用现代事件处理机制 (Safari兼容)');
+                replaceOnclickHandlers();
+            }} else {{
+                window.FileScanner.log('使用标准onclick事件处理');
+            }}
+        }}
+        
+        // 检测onclick支持
+        function supportsOnclick() {{
+            try {{
+                const testBtn = document.createElement('button');
+                testBtn.onclick = function() {{}};
+                return typeof testBtn.onclick === 'function';
+            }} catch (e) {{
+                return false;
+            }}
+        }}
+        
+        // 替换onclick为addEventListener（仅Safari需要时使用）
+        function replaceOnclickHandlers() {{
+            // 替换任务执行按钮
+            document.querySelectorAll('[onclick*="executeTask"]').forEach(btn => {{
+                const match = btn.getAttribute('onclick').match(/executeTask\\((\\d+)\\)/);
+                if (match) {{
+                    const taskIndex = parseInt(match[1]);
+                    btn.removeAttribute('onclick');
+                    btn.addEventListener('click', function(e) {{
+                        e.preventDefault();
+                        executeTask(taskIndex);
+                    }});
+                    window.FileScanner.log(`Replaced onclick for task ${{taskIndex}}`);
+                }}
+            }});
+            
+            // 替换其他按钮事件
+            const eventMap = {{
+                'refreshPage()': refreshPage,
+                'showApiKeyInput()': showApiKeyInput,
+                'saveApiKey()': saveApiKey,
+                'executeAll()': executeAll
+            }};
+            
+            Object.keys(eventMap).forEach(funcCall => {{
+                document.querySelectorAll(`[onclick="${{funcCall}}"]`).forEach(btn => {{
+                    btn.removeAttribute('onclick');
+                    btn.addEventListener('click', function(e) {{
+                        e.preventDefault();
+                        eventMap[funcCall]();
+                    }});
+                    window.FileScanner.log(`Replaced onclick for ${{funcCall}}`);
+                }});
+            }});
+        }}
+        
+        // Safari兼容的网络请求包装函数
+        async function safeFetch(url, options = {{}}) {{
+            const defaultOptions = {{
+                method: 'GET',
+                cache: 'no-cache',
+                ...options
+            }};
+            
+            // Safari特殊配置
+            if (isSafari()) {{
+                defaultOptions.credentials = 'same-origin';
+                defaultOptions.mode = 'cors';
+                // Safari可能需要明确的headers
+                defaultOptions.headers = {{
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    ...defaultOptions.headers
+                }};
+                window.FileScanner.log('使用Safari兼容配置');
+            }}
+            
+            try {{
+                window.FileScanner.log('发送请求到:', url, defaultOptions);
+                const response = await fetch(url, defaultOptions);
+                
+                window.FileScanner.log('响应状态:', {{
+                    status: response.status,
+                    statusText: response.statusText,
+                    ok: response.ok
+                }});
+                
+                return response;
+            }} catch (error) {{
+                window.FileScanner.log('网络请求失败:', error);
+                // Safari fallback: 尝试简化请求
+                if (isSafari() && options.retry !== false) {{
+                    window.FileScanner.log('尝试Safari fallback请求');
+                    return safeFetch(url, {{ ...options, retry: false, mode: 'no-cors' }});
+                }}
+                throw error;
+            }}
+        }}
+        
         // 执行单个任务
         async function executeTask(taskIndex) {{
             window.FileScanner.log(`开始执行任务 ${{taskIndex}}`);
@@ -1893,14 +2038,7 @@ function executeAllTasks() {
             
             try {{
                 const url = `/api/v1/plugin/FileScanner/execute_task?task_index=${{taskIndex}}&action=execute&apikey=${{apiKey}}`;
-                window.FileScanner.log('发送请求到:', url);
-                const response = await fetch(url);
-                
-                window.FileScanner.log('响应状态:', {{
-                    status: response.status,
-                    statusText: response.statusText,
-                    ok: response.ok
-                }});
+                const response = await safeFetch(url);
                 
                 if (!response.ok) {{
                     showResult(false, `任务 ${{taskIndex}} 请求失败：HTTP ${{response.status}}`);
@@ -1948,7 +2086,7 @@ function executeAllTasks() {
             
             try {{
                 const url = `/api/v1/plugin/FileScanner/execute_task?action=execute&apikey=${{apiKey}}`;
-                const response = await fetch(url);
+                const response = await safeFetch(url);
                 
                 if (!response.ok) {{
                     showResult(false, `批量执行请求失败：HTTP ${{response.status}}`);
@@ -2023,7 +2161,7 @@ function executeAllTasks() {
             
             try {{
                 const url = `/api/v1/plugin/FileScanner/downloader_tasks?status=${{status}}&page=${{page}}&count=20&apikey=${{apiKey}}`;
-                const response = await fetch(url);
+                const response = await safeFetch(url);
                 
                 if (!response.ok) {{
                     document.getElementById('download-tasks-container').innerHTML = `
@@ -2259,12 +2397,34 @@ function executeAllTasks() {
         // 页面加载时检查 API Key
         document.addEventListener('DOMContentLoaded', function() {{
             window.FileScanner.log('Dashboard 页面加载完成');
+            
+            // Safari兼容性检测和初始化
+            if (isSafari()) {{
+                window.FileScanner.log('检测到Safari浏览器，启用兼容模式');
+                showResult(true, '🦋 Safari兼容模式已启用');
+            }}
+            
+            // 初始化事件处理（Safari兼容）
+            initEventHandlers();
+            
             const apiKey = getApiKey();
             if (!apiKey) {{
                 window.FileScanner.log('未找到 API Key');
-                setTimeout(() => {{
-                    showResult(false, '提示：请设置 API Key 后才能执行任务');
-                }}, 1000);
+                if (isSafari()) {{
+                    // Safari用户特殊提示
+                    setTimeout(() => {{
+                        showResult(false, '🔑 Safari用户：请手动设置 API Key 或在URL中添加 ?apikey=YOUR_KEY');
+                    }}, 1500);
+                }} else {{
+                    setTimeout(() => {{
+                        showResult(false, '提示：请设置 API Key 后才能执行任务');
+                    }}, 1000);
+                }}
+            }} else {{
+                window.FileScanner.log('API Key 检测成功');
+                if (isSafari()) {{
+                    showResult(true, '✅ Safari: API Key 已就绪');
+                }}
             }}
             
             // 启动下载任务定时刷新
