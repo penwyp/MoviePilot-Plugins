@@ -1,6 +1,8 @@
 import json
+import logging
 import time
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional
 
@@ -12,7 +14,7 @@ from app import schemas
 from app.chain.transfer import TransferChain
 from app.core.event import eventmanager, EventType
 from app.db.transferhistory_oper import TransferHistoryOper
-from app.log import logger
+from app.log import logger, LoggerManager, log_settings
 from app.plugins import _PluginBase
 from app.schemas import NotificationType
 
@@ -28,7 +30,7 @@ class FileScanner(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/penwyp/MoviePilot-Plugins/main/icons/Filerun_A.png"
     # 插件版本
-    plugin_version = "3.1"
+    plugin_version = "3.2"
     # 插件作者
     plugin_author = "penwyp"
     # 作者主页
@@ -49,6 +51,9 @@ class FileScanner(_PluginBase):
     _batch_size = 10   # 批量处理大小限制
     _max_retries = 3   # 最大重试次数
     _skip_processed = True  # 跳过已整理文件
+    _debug_scheduler = False  # 调试模式
+    _scheduler_logger = None  # 独立的调度器日志记录器
+    _task_status = {}  # 任务执行状态记录
 
     def init_plugin(self, config: dict = None):
         """
@@ -63,6 +68,7 @@ class FileScanner(_PluginBase):
         self._batch_size = config.get("batch_size", 10)
         self._max_retries = config.get("max_retries", 3)
         self._skip_processed = config.get("skip_processed", True)
+        self._debug_scheduler = config.get("debug_scheduler", False)
         
         # 解析任务列表
         tasks_json = config.get("tasks", "[]")
@@ -75,6 +81,9 @@ class FileScanner(_PluginBase):
         # 初始化传输链
         if self._enabled:
             self._transfer_chain = TransferChain()
+            
+        # 初始化独立的调度器日志记录器
+        self._init_scheduler_logger()
 
     def get_state(self) -> bool:
         """
@@ -117,6 +126,14 @@ class FileScanner(_PluginBase):
                 "auth": "apikey",
                 "summary": "获取下载任务列表",
                 "description": "获取下载任务列表，支持状态过滤和分页。参数：status(all/downloading/completed), page(页码), count(每页数量)"
+            },
+            {
+                "path": "/task_status",
+                "endpoint": self.task_status_api,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "获取任务执行状态",
+                "description": "获取所有定时任务的执行状态、历史记录和下次执行时间"
             }
         ]
 
@@ -255,6 +272,24 @@ class FileScanner(_PluginBase):
                                         }
                                     }
                                 ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'debug_scheduler',
+                                            'label': '调度器调试模式',
+                                            'color': 'warning',
+                                            'hint': '启用后将输出详细的定时任务执行日志，便于排查问题'
+                                        }
+                                    }
+                                ]
                             }
                         ]
                     },
@@ -346,6 +381,7 @@ class FileScanner(_PluginBase):
             "batch_size": 10,
             "max_retries": 3,
             "skip_processed": True,
+            "debug_scheduler": False,
             "tasks": json.dumps([{
                 "name": "示例任务",
                 "enabled": True,
@@ -639,70 +675,141 @@ function executeAllTasks() {
         }]
         """
         if not self._enabled or not self._tasks:
+            self._log_scheduler("info", "插件未启用或无任务配置，跳过服务注册")
             return []
         
         services = []
         
+        self._log_scheduler("info", f"开始注册定时服务，共有 {len(self._tasks)} 个任务")
+        
         # 为每个启用的任务创建独立的定时服务
         for idx, task in enumerate(self._tasks):
             if not isinstance(task, dict) or not task.get('enabled', True):
+                self._log_scheduler("debug", f"任务 {idx} 未启用或配置无效，跳过")
                 continue
                 
             # 获取任务的cron表达式，默认为每天凌晨3点
             task_cron = task.get('cron', '0 3 * * *')
             task_name = task.get('name', f'任务{idx+1}')
             
-            services.append({
+            service_info = {
                 "id": f"FileScanner_Task_{idx}",
                 "name": f"文件扫描整理 - {task_name}",
                 "trigger": CronTrigger.from_crontab(task_cron),
                 "func": self.scan_and_transfer_single_task,
                 "kwargs": {"task_index": idx}
-            })
+            }
+            
+            services.append(service_info)
+            
+            # 记录服务注册信息
+            self._log_scheduler("info", f"注册定时任务: {task_name}")
+            self._log_scheduler("info", f"  - 任务ID: {service_info['id']}")
+            self._log_scheduler("info", f"  - CRON表达式: {task_cron}")
+            self._log_scheduler("info", f"  - 任务配置: {task}")
         
+        self._log_scheduler("info", f"服务注册完成，共注册 {len(services)} 个定时任务")
         return services
 
     def scan_and_transfer_single_task(self, task_index: int = None, **kwargs):
         """
         执行单个扫描整理任务
         """
+        start_time = datetime.now()
+        
+        # 记录任务触发
+        self._log_scheduler("info", "=" * 60)
+        self._log_scheduler("info", f"定时任务触发 - Task Index: {task_index}")
+        self._log_scheduler("debug", f"触发参数: {kwargs}")
+        
         if task_index is None:
-            logger.error("文件扫描整理：task_index 参数不能为空")
+            error_msg = "文件扫描整理：task_index 参数不能为空"
+            logger.error(error_msg)
+            self._log_scheduler("error", error_msg)
             return
             
         if not self._enabled:
+            self._log_scheduler("warning", "插件未启用，跳过任务执行")
             return
             
         if not self._tasks or task_index >= len(self._tasks):
-            logger.warning(f"文件扫描整理：任务索引 {task_index} 无效")
+            error_msg = f"文件扫描整理：任务索引 {task_index} 无效"
+            logger.warning(error_msg)
+            self._log_scheduler("warning", error_msg)
             return
             
         task = self._tasks[task_index]
         if not isinstance(task, dict) or not task.get('enabled', True):
+            self._log_scheduler("info", f"任务 {task_index} 未启用，跳过执行")
             return
             
         task_name = task.get('name', f'任务{task_index+1}')
         logger.info(f"开始执行定时任务: {task_name}")
         
+        # 记录任务开始
+        self._log_scheduler("info", f"开始执行任务: {task_name}")
+        self._log_scheduler("info", f"任务配置: {task}")
+        
         # 执行SQL清理操作（静默执行，只记录日志）
+        self._log_scheduler("debug", "执行SQL清理操作")
         self._execute_cleanup_sql()
         
         messages = []
         
         # 检查是否跳过已整理文件
         if self._skip_processed and self._is_task_processed(task):
+            skip_msg = f"任务 [{task_name}] 已整理过，跳过处理"
             messages.append(f"⏭️ {task_name}: 已整理过，跳过")
-            logger.info(f"任务 [{task_name}] 已整理过，跳过处理")
+            logger.info(skip_msg)
+            self._log_scheduler("info", skip_msg)
+            
+            # 更新任务状态
+            self._update_task_status(task_index, {
+                "last_run": start_time.isoformat(),
+                "skip_count": self._task_status.get(f"task_{task_index}", {}).get("skip_count", 0) + 1,
+                "last_status": "skipped",
+                "last_message": "已整理过，跳过处理"
+            })
+            
             if self._notify:
                 self.post_message(
                     mtype=NotificationType.Plugin,
                     title=f"定时任务跳过: {task_name}",
                     text="该任务的文件已整理过，跳过处理"
                 )
+            
+            # 记录任务结束
+            end_time = datetime.now()
+            elapsed_time = (end_time - start_time).total_seconds()
+            self._log_scheduler("info", f"任务结束 - 状态: 跳过, 耗时: {elapsed_time:.2f}秒")
+            self._log_scheduler("info", "=" * 60)
             return
         
         # 执行单个任务
+        self._log_scheduler("info", "开始执行文件整理...")
         success = self._execute_single_task(task, task_name, messages)
+        
+        # 更新任务状态
+        status_update = {
+            "last_run": start_time.isoformat(),
+            "last_status": "success" if success else "failed",
+            "last_message": messages[-1] if messages else ""
+        }
+        
+        if success:
+            status_update["success_count"] = self._task_status.get(f"task_{task_index}", {}).get("success_count", 0) + 1
+        else:
+            status_update["fail_count"] = self._task_status.get(f"task_{task_index}", {}).get("fail_count", 0) + 1
+            
+        self._update_task_status(task_index, status_update)
+        
+        # 记录任务结束
+        end_time = datetime.now()
+        elapsed_time = (end_time - start_time).total_seconds()
+        self._log_scheduler("info", f"任务执行结果: {'成功' if success else '失败'}")
+        self._log_scheduler("info", f"执行消息: {messages}")
+        self._log_scheduler("info", f"任务结束 - 状态: {'成功' if success else '失败'}, 耗时: {elapsed_time:.2f}秒")
+        self._log_scheduler("info", "=" * 60)
         
         # 发送通知
         if self._notify and messages:
@@ -787,14 +894,24 @@ function executeAllTasks() {
             target_storage = task.get('target_storage')
             target_path = task.get('target_path')
             
+            self._log_scheduler("debug", f"执行任务参数检查 - 任务: {task_name}")
+            self._log_scheduler("debug", f"  源路径: {source_path}")
+            self._log_scheduler("debug", f"  目标存储: {target_storage}")
+            self._log_scheduler("debug", f"  目标路径: {target_path}")
+            
             if not all([source_path, target_storage, target_path]):
-                logger.error(f"任务 [{task_name}] 缺少必需参数")
+                error_msg = f"任务 [{task_name}] 缺少必需参数"
+                logger.error(error_msg)
+                self._log_scheduler("error", error_msg)
                 messages.append(f"❌ {task_name}: 配置不完整")
                 return False
             
             # 检查存储连接状态
+            self._log_scheduler("info", f"检查存储连接状态: {target_storage}")
             if not self._check_storage_connection(target_storage):
-                logger.error(f"任务 [{task_name}] 目标存储 {target_storage} 连接失败")
+                error_msg = f"任务 [{task_name}] 目标存储 {target_storage} 连接失败"
+                logger.error(error_msg)
+                self._log_scheduler("error", error_msg)
                 messages.append(f"❌ {task_name}: 存储连接失败")
                 return False
             
@@ -813,7 +930,15 @@ function executeAllTasks() {
             library_category_folder = task.get('library_category_folder', True)
             library_type_folder = task.get('library_type_folder', True)
             
+            self._log_scheduler("info", f"任务配置详情:")
+            self._log_scheduler("info", f"  整理方式: {transfer_type}")
+            self._log_scheduler("info", f"  最小文件大小: {min_filesize} MB")
+            self._log_scheduler("info", f"  刮削信息: {scrape}")
+            self._log_scheduler("info", f"  媒体库分类目录: {library_category_folder}")
+            self._log_scheduler("info", f"  媒体库类型目录: {library_type_folder}")
+            
             logger.info(f"执行任务 [{task_name}]: {source_path} -> {target_storage}:{target_path}")
+            self._log_scheduler("info", f"开始执行文件整理: {source_path} -> {target_storage}:{target_path}")
             
             # 重试机制
             for retry_count in range(self._max_retries + 1):
@@ -822,9 +947,11 @@ function executeAllTasks() {
                     if retry_count > 0:
                         wait_time = self._process_delay * (retry_count + 1)
                         logger.info(f"任务 [{task_name}] 第{retry_count}次重试，等待{wait_time}秒...")
+                        self._log_scheduler("warning", f"第 {retry_count} 次重试，等待 {wait_time} 秒")
                         time.sleep(wait_time)
                     
                     # 调用整理方法
+                    self._log_scheduler("info", f"调用传输链进行文件整理 (尝试 {retry_count + 1}/{self._max_retries + 1})")
                     success, message = self._transfer_chain.manual_transfer(
                         fileitem=fileitem,
                         target_storage=target_storage,
@@ -840,16 +967,19 @@ function executeAllTasks() {
                     if success:
                         messages.append(f"✅ {task_name}: 整理成功")
                         logger.info(f"任务 [{task_name}] 执行成功")
+                        self._log_scheduler("info", f"✅ 任务执行成功: {message}")
                         return True
                     else:
                         # 检查是否是认证相关错误
                         if self._is_auth_error(message):
                             if retry_count < self._max_retries:
                                 logger.warning(f"任务 [{task_name}] 认证失败，将进行重试: {message}")
+                                self._log_scheduler("warning", f"认证失败，准备重试: {message}")
                                 continue
                         
                         messages.append(f"❌ {task_name}: {message}")
                         logger.error(f"任务 [{task_name}] 执行失败: {message}")
+                        self._log_scheduler("error", f"❌ 任务执行失败: {message}")
                         return False
                         
                 except Exception as e:
@@ -2557,6 +2687,76 @@ function executeAllTasks() {
                 "success": False,
                 "message": error_msg
             }
+    
+    def task_status_api(self):
+        """
+        API接口：获取所有任务的执行状态
+        :return: 任务状态信息
+        """
+        try:
+            self._log_scheduler("info", "API请求获取任务状态")
+            
+            status_info = {
+                "enabled": self._enabled,
+                "debug_mode": self._debug_scheduler,
+                "total_tasks": len(self._tasks),
+                "task_details": []
+            }
+            
+            # 获取每个任务的状态
+            for idx, task in enumerate(self._tasks):
+                if not isinstance(task, dict):
+                    continue
+                    
+                task_key = f"task_{idx}"
+                task_status = self._task_status.get(task_key, {})
+                
+                task_info = {
+                    "index": idx,
+                    "name": task.get('name', f'任务{idx+1}'),
+                    "enabled": task.get('enabled', True),
+                    "cron": task.get('cron', '0 3 * * *'),
+                    "source_path": task.get('source_path'),
+                    "target_storage": task.get('target_storage'),
+                    "target_path": task.get('target_path'),
+                    "status": {
+                        "last_run": task_status.get('last_run'),
+                        "last_status": task_status.get('last_status'),
+                        "last_message": task_status.get('last_message'),
+                        "success_count": task_status.get('success_count', 0),
+                        "fail_count": task_status.get('fail_count', 0),
+                        "skip_count": task_status.get('skip_count', 0)
+                    }
+                }
+                
+                # 尝试获取下次执行时间（需要访问APScheduler）
+                try:
+                    from app.scheduler import scheduler
+                    job_id = f"FileScanner_Task_{idx}"
+                    job = scheduler.get_job(job_id)
+                    if job:
+                        task_info["next_run"] = job.next_run_time.isoformat() if job.next_run_time else None
+                except Exception as e:
+                    self._log_scheduler("debug", f"获取任务 {idx} 下次执行时间失败: {str(e)}")
+                    task_info["next_run"] = None
+                
+                status_info["task_details"].append(task_info)
+            
+            self._log_scheduler("info", f"返回 {len(status_info['task_details'])} 个任务的状态信息")
+            
+            return {
+                "success": True,
+                "data": status_info
+            }
+            
+        except Exception as e:
+            error_msg = f"获取任务状态时发生异常: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self._log_scheduler("error", error_msg)
+            return {
+                "success": False,
+                "message": error_msg
+            }
 
     def post_message(self, mtype: NotificationType, title: str, text: str, **kwargs):
         """
@@ -2572,8 +2772,99 @@ function executeAllTasks() {
             }
         )
 
+    def _init_scheduler_logger(self):
+        """
+        初始化独立的调度器日志记录器
+        """
+        try:
+            # 创建日志目录
+            log_dir = log_settings.LOG_PATH / "plugins"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 创建独立的日志记录器
+            self._scheduler_logger = logging.getLogger(f"filescanner_scheduler")
+            self._scheduler_logger.setLevel(logging.DEBUG if self._debug_scheduler else logging.INFO)
+            
+            # 清除已有的处理器
+            self._scheduler_logger.handlers.clear()
+            
+            # 创建文件处理器
+            log_file = log_dir / "filescanner_scheduler.log"
+            file_handler = RotatingFileHandler(
+                filename=log_file,
+                maxBytes=5 * 1024 * 1024,  # 5MB
+                backupCount=7,  # 保留7个备份文件
+                encoding='utf-8'
+            )
+            
+            # 设置日志格式
+            formatter = logging.Formatter(
+                '%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            file_handler.setFormatter(formatter)
+            
+            # 添加处理器
+            self._scheduler_logger.addHandler(file_handler)
+            
+            # 如果是调试模式，也输出到控制台
+            if self._debug_scheduler:
+                console_handler = logging.StreamHandler()
+                console_handler.setFormatter(formatter)
+                self._scheduler_logger.addHandler(console_handler)
+            
+            # 禁止传播到父日志器
+            self._scheduler_logger.propagate = False
+            
+            # 记录初始化成功
+            self._scheduler_logger.info("=" * 60)
+            self._scheduler_logger.info(f"FileScanner 调度器日志系统初始化成功")
+            self._scheduler_logger.info(f"插件版本: {self.plugin_version}")
+            self._scheduler_logger.info(f"调试模式: {'开启' if self._debug_scheduler else '关闭'}")
+            self._scheduler_logger.info(f"任务数量: {len(self._tasks)}")
+            self._scheduler_logger.info("=" * 60)
+            
+        except Exception as e:
+            logger.error(f"初始化调度器日志记录器失败: {str(e)}")
+            # 如果初始化失败，使用默认日志器
+            self._scheduler_logger = logger
+    
+    def _log_scheduler(self, level: str, message: str, **kwargs):
+        """
+        记录调度器日志
+        """
+        if not self._scheduler_logger:
+            self._scheduler_logger = logger
+            
+        log_method = getattr(self._scheduler_logger, level, self._scheduler_logger.info)
+        log_method(message, **kwargs)
+    
+    def _update_task_status(self, task_index: int, status: dict):
+        """
+        更新任务执行状态
+        """
+        task_key = f"task_{task_index}"
+        if task_key not in self._task_status:
+            self._task_status[task_key] = {
+                "last_run": None,
+                "next_run": None,
+                "success_count": 0,
+                "fail_count": 0,
+                "skip_count": 0,
+                "last_status": None,
+                "last_message": None
+            }
+        
+        self._task_status[task_key].update(status)
+        
+        # 记录到日志
+        if status.get("last_run"):
+            self._log_scheduler("info", f"任务状态更新 - {task_key}: {status}")
+
     def stop_service(self):
         """
         停止插件
         """
-        pass
+        if self._scheduler_logger:
+            self._log_scheduler("info", "FileScanner 插件停止服务")
+            self._log_scheduler("info", "=" * 60)
