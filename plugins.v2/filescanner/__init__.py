@@ -57,11 +57,15 @@ class FileScanner(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         """
-        初始化插件
+        初始化插件 - 增强版本
         """
+        self._log_scheduler("info", "开始初始化 FileScanner 插件")
+        
         if not config:
+            self._log_scheduler("warning", "插件配置为空，使用默认配置")
             return
         
+        # 配置参数初始化
         self._enabled = config.get("enabled", False)
         self._notify = config.get("notify", False)
         self._process_delay = config.get("process_delay", 2)
@@ -70,20 +74,72 @@ class FileScanner(_PluginBase):
         self._skip_processed = config.get("skip_processed", True)
         self._debug_scheduler = config.get("debug_scheduler", False)
         
+        self._log_scheduler("info", f"插件配置: enabled={self._enabled}, notify={self._notify}, debug={self._debug_scheduler}")
+        
+        # 初始化独立的调度器日志记录器（优先初始化，以便后续日志记录）
+        try:
+            self._init_scheduler_logger()
+        except Exception as e:
+            logger.error(f"初始化调度器日志记录器失败: {str(e)}")
+            # 使用默认日志器
+            self._scheduler_logger = logger
+        
         # 解析任务列表
         tasks_json = config.get("tasks", "[]")
         try:
             self._tasks = json.loads(tasks_json) if isinstance(tasks_json, str) else tasks_json
+            self._log_scheduler("info", f"成功解析任务配置，共 {len(self._tasks)} 个任务")
+            
+            # 验证任务配置
+            valid_count = 0
+            for idx, task in enumerate(self._tasks):
+                if not isinstance(task, dict):
+                    self._log_scheduler("warning", f"任务 {idx} 配置无效：不是字典类型")
+                    continue
+                
+                # 验证必需字段
+                required_fields = ['source_path', 'target_storage', 'target_path']
+                missing_fields = [field for field in required_fields if not task.get(field)]
+                if missing_fields:
+                    self._log_scheduler("warning", f"任务 {idx} 缺少必需字段: {missing_fields}")
+                    continue
+                
+                valid_count += 1
+                self._log_scheduler("debug", f"任务 {idx} 验证通过: {task.get('name', f'任务{idx+1}')}")
+            
+            self._log_scheduler("info", f"有效任务数量: {valid_count}/{len(self._tasks)}")
+            
         except Exception as e:
-            logger.error(f"解析任务配置失败: {str(e)}")
+            error_msg = f"解析任务配置失败: {str(e)}"
+            logger.error(error_msg)
+            self._log_scheduler("error", error_msg)
             self._tasks = []
         
         # 初始化传输链
         if self._enabled:
-            self._transfer_chain = TransferChain()
-            
-        # 初始化独立的调度器日志记录器
-        self._init_scheduler_logger()
+            try:
+                self._transfer_chain = TransferChain()
+                self._log_scheduler("info", "传输链初始化成功")
+            except Exception as e:
+                error_msg = f"传输链初始化失败: {str(e)}"
+                logger.error(error_msg)
+                self._log_scheduler("error", error_msg)
+                # 不中断插件初始化，但在任务执行时会重新尝试初始化
+        
+        # 恢复任务状态
+        try:
+            if self._recover_task_status():
+                self._log_scheduler("info", "任务状态恢复完成")
+            else:
+                self._log_scheduler("debug", "没有需要恢复的任务状态")
+        except Exception as e:
+            self._log_scheduler("warning", f"恢复任务状态失败: {str(e)}")
+        
+        self._log_scheduler("info", "FileScanner 插件初始化完成")
+        
+        # 如果启用了调试模式，输出详细配置
+        if self._debug_scheduler:
+            self._log_scheduler("debug", f"完整配置: {json.dumps(config, ensure_ascii=False, indent=2)}")
 
     def get_state(self) -> bool:
         """
@@ -668,30 +724,70 @@ function executeAllTasks() {
         注册插件公共服务
         [{
             "id": "服务ID",
-            "name": "服务名称", 
+            "name": "服务名称",
             "trigger": "触发器：cron/interval/date/CronTrigger.from_crontab()",
             "func": self.xxx,
             "kwargs": {} # 定时器参数
         }]
         """
-        if not self._enabled or not self._tasks:
-            self._log_scheduler("info", "插件未启用或无任务配置，跳过服务注册")
+        # 确保日志记录器已初始化
+        if not self._scheduler_logger:
+            self._init_scheduler_logger()
+            
+        if not self._enabled:
+            self._log_scheduler("warning", "插件未启用，跳过服务注册")
+            return []
+            
+        if not self._tasks:
+            self._log_scheduler("warning", "无任务配置，跳过服务注册")
             return []
         
         services = []
         
         self._log_scheduler("info", f"开始注册定时服务，共有 {len(self._tasks)} 个任务")
         
-        # 为每个启用的任务创建独立的定时服务
+        # 验证任务配置的有效性
+        valid_tasks = []
         for idx, task in enumerate(self._tasks):
-            if not isinstance(task, dict) or not task.get('enabled', True):
-                self._log_scheduler("debug", f"任务 {idx} 未启用或配置无效，跳过")
+            if not isinstance(task, dict):
+                self._log_scheduler("error", f"任务 {idx} 配置无效：不是字典类型")
                 continue
                 
-            # 获取任务的cron表达式，默认为每天凌晨3点
+            if not task.get('enabled', True):
+                self._log_scheduler("info", f"任务 {idx} 已禁用，跳过注册")
+                continue
+                
+            # 验证必需字段
+            required_fields = ['source_path', 'target_storage', 'target_path']
+            missing_fields = [field for field in required_fields if not task.get(field)]
+            if missing_fields:
+                self._log_scheduler("error", f"任务 {idx} 缺少必需字段: {missing_fields}")
+                continue
+                
+            # 验证cron表达式
+            task_cron = task.get('cron', '0 3 * * *')
+            try:
+                # 尝试解析cron表达式
+                CronTrigger.from_crontab(task_cron)
+            except Exception as e:
+                self._log_scheduler("error", f"任务 {idx} 的cron表达式无效: {task_cron}, 错误: {str(e)}")
+                # 使用默认的cron表达式
+                task_cron = '0 3 * * *'
+                task['cron'] = task_cron
+                self._log_scheduler("warning", f"任务 {idx} 使用默认cron表达式: {task_cron}")
+            
+            valid_tasks.append((idx, task))
+        
+        if not valid_tasks:
+            self._log_scheduler("warning", "没有有效的任务配置，跳过服务注册")
+            return []
+        
+        # 为每个有效的任务创建独立的定时服务
+        for idx, task in valid_tasks:
             task_cron = task.get('cron', '0 3 * * *')
             task_name = task.get('name', f'任务{idx+1}')
             
+            # 创建服务配置
             service_info = {
                 "id": f"FileScanner_Task_{idx}",
                 "name": f"文件扫描整理 - {task_name}",
@@ -703,123 +799,209 @@ function executeAllTasks() {
             services.append(service_info)
             
             # 记录服务注册信息
-            self._log_scheduler("info", f"注册定时任务: {task_name}")
+            self._log_scheduler("info", f"成功注册定时任务: {task_name}")
             self._log_scheduler("info", f"  - 任务ID: {service_info['id']}")
             self._log_scheduler("info", f"  - CRON表达式: {task_cron}")
-            self._log_scheduler("info", f"  - 任务配置: {task}")
+            self._log_scheduler("info", f"  - 源路径: {task.get('source_path')}")
+            self._log_scheduler("info", f"  - 目标路径: {task.get('target_storage')}:{task.get('target_path')}")
+            
+            # 初始化任务状态
+            self._init_task_status(idx)
         
         self._log_scheduler("info", f"服务注册完成，共注册 {len(services)} 个定时任务")
+        
+        # 记录整体状态
+        if services:
+            self._log_scheduler("info", f"定时任务服务注册成功，等待调度器调度执行")
+            # 强制刷新调度器（如果支持）
+            try:
+                from app.scheduler import scheduler
+                if hasattr(scheduler, 'refresh'):
+                    scheduler.refresh()
+                    self._log_scheduler("debug", "调度器已刷新")
+            except Exception as e:
+                self._log_scheduler("debug", f"刷新调度器失败（非关键错误）: {str(e)}")
+        
         return services
 
     def scan_and_transfer_single_task(self, task_index: int = None, **kwargs):
         """
-        执行单个扫描整理任务
+        执行单个扫描整理任务 - 增强版本
         """
         start_time = datetime.now()
+        
+        # 确保日志记录器已初始化
+        if not self._scheduler_logger:
+            self._init_scheduler_logger()
         
         # 记录任务触发
         self._log_scheduler("info", "=" * 60)
         self._log_scheduler("info", f"定时任务触发 - Task Index: {task_index}")
         self._log_scheduler("debug", f"触发参数: {kwargs}")
+        self._log_scheduler("debug", f"插件状态: enabled={self._enabled}, tasks_count={len(self._tasks) if self._tasks else 0}")
         
+        # 参数验证
         if task_index is None:
             error_msg = "文件扫描整理：task_index 参数不能为空"
             logger.error(error_msg)
             self._log_scheduler("error", error_msg)
             return
             
+        # 插件状态检查
         if not self._enabled:
             self._log_scheduler("warning", "插件未启用，跳过任务执行")
             return
             
+        # 任务列表验证
         if not self._tasks or task_index >= len(self._tasks):
-            error_msg = f"文件扫描整理：任务索引 {task_index} 无效"
+            error_msg = f"文件扫描整理：任务索引 {task_index} 无效，当前任务总数: {len(self._tasks) if self._tasks else 0}"
             logger.warning(error_msg)
             self._log_scheduler("warning", error_msg)
             return
             
+        # 获取任务配置
         task = self._tasks[task_index]
-        if not isinstance(task, dict) or not task.get('enabled', True):
-            self._log_scheduler("info", f"任务 {task_index} 未启用，跳过执行")
+        if not isinstance(task, dict):
+            error_msg = f"任务 {task_index} 配置格式错误：期望dict，实际{type(task)}"
+            logger.error(error_msg)
+            self._log_scheduler("error", error_msg)
             return
             
+        if not task.get('enabled', True):
+            self._log_scheduler("info", f"任务 {task_index} 已禁用，跳过执行")
+            return
+        
         task_name = task.get('name', f'任务{task_index+1}')
         logger.info(f"开始执行定时任务: {task_name}")
         
         # 记录任务开始
         self._log_scheduler("info", f"开始执行任务: {task_name}")
-        self._log_scheduler("info", f"任务配置: {task}")
+        self._log_scheduler("debug", f"任务完整配置: {json.dumps(task, ensure_ascii=False, indent=2)}")
         
-        # 执行SQL清理操作（静默执行，只记录日志）
-        self._log_scheduler("debug", "执行SQL清理操作")
-        self._execute_cleanup_sql()
+        # 验证任务配置完整性
+        required_fields = ['source_path', 'target_storage', 'target_path']
+        missing_fields = [field for field in required_fields if not task.get(field)]
+        if missing_fields:
+            error_msg = f"任务 [{task_name}] 缺少必需字段: {missing_fields}"
+            logger.error(error_msg)
+            self._log_scheduler("error", error_msg)
+            
+            # 更新任务状态为失败
+            self._update_task_status(task_index, {
+                "last_run": start_time.isoformat(),
+                "last_status": "failed",
+                "last_message": f"配置错误：缺少字段 {missing_fields}"
+            })
+            return
+        
+        # 初始化传输链（如果尚未初始化）
+        if not self._transfer_chain:
+            try:
+                self._transfer_chain = TransferChain()
+                self._log_scheduler("info", "传输链初始化成功")
+            except Exception as e:
+                error_msg = f"传输链初始化失败: {str(e)}"
+                logger.error(error_msg)
+                self._log_scheduler("error", error_msg)
+                
+                self._update_task_status(task_index, {
+                    "last_run": start_time.isoformat(),
+                    "last_status": "failed",
+                    "last_message": f"传输链初始化失败: {str(e)}"
+                })
+                return
         
         messages = []
         
-        # 检查是否跳过已整理文件
-        if self._skip_processed and self._is_task_processed(task):
-            skip_msg = f"任务 [{task_name}] 已整理过，跳过处理"
-            messages.append(f"⏭️ {task_name}: 已整理过，跳过")
-            logger.info(skip_msg)
-            self._log_scheduler("info", skip_msg)
+        try:
+            # 延迟执行SQL清理操作，避免影响任务执行
+            self._log_scheduler("debug", "准备执行SQL清理操作")
+            self._execute_cleanup_sql()
+            
+            # 检查是否跳过已整理文件
+            if self._skip_processed and self._is_task_processed(task):
+                skip_msg = f"任务 [{task_name}] 已整理过，跳过处理"
+                messages.append(f"⏭️ {task_name}: 已整理过，跳过")
+                logger.info(skip_msg)
+                self._log_scheduler("info", skip_msg)
+                
+                # 更新任务状态
+                self._update_task_status(task_index, {
+                    "last_run": start_time.isoformat(),
+                    "skip_count": self._task_status.get(f"task_{task_index}", {}).get("skip_count", 0) + 1,
+                    "last_status": "skipped",
+                    "last_message": "已整理过，跳过处理"
+                })
+                
+                if self._notify:
+                    self.post_message(
+                        mtype=NotificationType.Plugin,
+                        title=f"定时任务跳过: {task_name}",
+                        text="该任务的文件已整理过，跳过处理"
+                    )
+                
+                # 记录任务结束
+                end_time = datetime.now()
+                elapsed_time = (end_time - start_time).total_seconds()
+                self._log_scheduler("info", f"任务结束 - 状态: 跳过, 耗时: {elapsed_time:.2f}秒")
+                self._log_scheduler("info", "=" * 60)
+                return
+            
+            # 执行单个任务
+            self._log_scheduler("info", "开始执行文件整理...")
+            success = self._execute_single_task(task, task_name, messages)
             
             # 更新任务状态
+            status_update = {
+                "last_run": start_time.isoformat(),
+                "last_status": "success" if success else "failed",
+                "last_message": messages[-1] if messages else ""
+            }
+            
+            if success:
+                status_update["success_count"] = self._task_status.get(f"task_{task_index}", {}).get("success_count", 0) + 1
+            else:
+                status_update["fail_count"] = self._task_status.get(f"task_{task_index}", {}).get("fail_count", 0) + 1
+                
+            self._update_task_status(task_index, status_update)
+            
+            # 记录任务结束
+            end_time = datetime.now()
+            elapsed_time = (end_time - start_time).total_seconds()
+            self._log_scheduler("info", f"任务执行结果: {'成功' if success else '失败'}")
+            if messages:
+                self._log_scheduler("info", f"执行消息: {messages}")
+            self._log_scheduler("info", f"任务结束 - 状态: {'成功' if success else '失败'}, 耗时: {elapsed_time:.2f}秒")
+            self._log_scheduler("info", "=" * 60)
+            
+            # 发送通知
+            if self._notify and messages:
+                title = f"定时任务完成: {task_name}"
+                text = "\n".join(messages)
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title=title,
+                    text=text
+                )
+                
+        except Exception as e:
+            error_msg = f"执行任务 [{task_name}] 时发生未预期异常: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self._log_scheduler("error", error_msg)
+            
+            # 更新任务状态为失败
             self._update_task_status(task_index, {
                 "last_run": start_time.isoformat(),
-                "skip_count": self._task_status.get(f"task_{task_index}", {}).get("skip_count", 0) + 1,
-                "last_status": "skipped",
-                "last_message": "已整理过，跳过处理"
+                "last_status": "failed",
+                "last_message": f"执行异常: {str(e)}"
             })
             
             if self._notify:
                 self.post_message(
                     mtype=NotificationType.Plugin,
-                    title=f"定时任务跳过: {task_name}",
-                    text="该任务的文件已整理过，跳过处理"
+                    title=f"定时任务异常: {task_name}",
+                    text=f"任务执行过程中发生异常: {str(e)}"
                 )
-            
-            # 记录任务结束
-            end_time = datetime.now()
-            elapsed_time = (end_time - start_time).total_seconds()
-            self._log_scheduler("info", f"任务结束 - 状态: 跳过, 耗时: {elapsed_time:.2f}秒")
-            self._log_scheduler("info", "=" * 60)
-            return
-        
-        # 执行单个任务
-        self._log_scheduler("info", "开始执行文件整理...")
-        success = self._execute_single_task(task, task_name, messages)
-        
-        # 更新任务状态
-        status_update = {
-            "last_run": start_time.isoformat(),
-            "last_status": "success" if success else "failed",
-            "last_message": messages[-1] if messages else ""
-        }
-        
-        if success:
-            status_update["success_count"] = self._task_status.get(f"task_{task_index}", {}).get("success_count", 0) + 1
-        else:
-            status_update["fail_count"] = self._task_status.get(f"task_{task_index}", {}).get("fail_count", 0) + 1
-            
-        self._update_task_status(task_index, status_update)
-        
-        # 记录任务结束
-        end_time = datetime.now()
-        elapsed_time = (end_time - start_time).total_seconds()
-        self._log_scheduler("info", f"任务执行结果: {'成功' if success else '失败'}")
-        self._log_scheduler("info", f"执行消息: {messages}")
-        self._log_scheduler("info", f"任务结束 - 状态: {'成功' if success else '失败'}, 耗时: {elapsed_time:.2f}秒")
-        self._log_scheduler("info", "=" * 60)
-        
-        # 发送通知
-        if self._notify and messages:
-            title = f"定时任务完成: {task_name}"
-            text = "\n".join(messages)
-            self.post_message(
-                mtype=NotificationType.Plugin,
-                title=title,
-                text=text
-            )
 
     def scan_and_transfer_task(self):
         """
@@ -998,21 +1180,144 @@ function executeAllTasks() {
             return False
                     
         except Exception as e:
+            error_msg = f"执行任务 [{task_name}] 时发生异常: {str(e)}"
             messages.append(f"❌ {task_name}: {str(e)}")
-            logger.error(f"执行任务 [{task_name}] 时发生异常: {str(e)}", exc_info=True)
+            logger.error(error_msg, exc_info=True)
+            self._log_scheduler("error", error_msg)
             return False
 
     def _check_storage_connection(self, storage_name: str) -> bool:
         """
-        检查存储连接状态
+        检查存储连接状态 - 增强版本
         """
         try:
-            # 这里可以添加存储连接检查逻辑
+            self._log_scheduler("debug", f"开始检查存储连接状态: {storage_name}")
+            
+            # 这里可以添加实际的存储连接检查逻辑
             # 目前简单返回True，实际项目中可以调用存储模块的连接检查方法
+            
+            # 模拟连接检查延迟
+            import time
+            time.sleep(0.1)
+            
+            self._log_scheduler("debug", f"存储连接状态检查完成: {storage_name}")
             return True
+            
         except Exception as e:
-            logger.error(f"检查存储 {storage_name} 连接状态失败: {str(e)}")
+            error_msg = f"检查存储 {storage_name} 连接状态失败: {str(e)}"
+            logger.error(error_msg)
+            self._log_scheduler("error", error_msg)
             return False
+
+    def _execute_cleanup_sql(self):
+        """
+        执行SQL清理操作，删除dest_storage='local'的转移历史记录
+        增强版本：添加更多控制和日志记录
+        """
+        cleanup_start = datetime.now()
+        
+        try:
+            # 获取数据库操作对象
+            transferhis = TransferHistoryOper()
+            
+            # 检查是否有数据库会话
+            if not transferhis._db:
+                from app.db import ScopedSession
+                transferhis._db = ScopedSession()
+                should_close = True
+            else:
+                should_close = False
+            
+            try:
+                # 执行查询操作 - 统计要删除的记录数
+                self._log_scheduler("debug", "开始查询需要清理的转移历史记录")
+                count_result = transferhis._db.execute(
+                    text("SELECT COUNT(*) FROM transferhistory WHERE dest_storage = 'local'")
+                ).scalar()
+                
+                if count_result > 0:
+                    self._log_scheduler("info", f"发现 {count_result} 条dest_storage='local'的转移历史记录需要清理")
+                    
+                    # 执行删除操作
+                    self._log_scheduler("debug", "开始执行删除操作")
+                    delete_result = transferhis._db.execute(
+                        text("DELETE FROM transferhistory WHERE dest_storage = 'local'")
+                    )
+                    
+                    # 提交事务
+                    transferhis._db.commit()
+                    
+                    affected_rows = delete_result.rowcount if hasattr(delete_result, 'rowcount') else count_result
+                    self._log_scheduler("info", f"成功删除 {affected_rows} 条dest_storage='local'的转移历史记录")
+                    
+                    # 记录清理耗时
+                    cleanup_time = (datetime.now() - cleanup_start).total_seconds()
+                    self._log_scheduler("debug", f"SQL清理操作完成，耗时: {cleanup_time:.2f}秒")
+                else:
+                    self._log_scheduler("debug", "没有需要清理的转移历史记录")
+                
+            except Exception as e:
+                # 回滚事务
+                if transferhis._db:
+                    transferhis._db.rollback()
+                raise e
+            finally:
+                # 如果是我们创建的会话，需要关闭
+                if should_close and transferhis._db:
+                    transferhis._db.close()
+                    
+        except Exception as e:
+            error_msg = f"执行SQL清理操作失败: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self._log_scheduler("error", error_msg)
+            
+            # 记录清理失败耗时
+            cleanup_time = (datetime.now() - cleanup_start).total_seconds()
+            self._log_scheduler("debug", f"SQL清理操作失败，耗时: {cleanup_time:.2f}秒")
+
+    def _should_execute_cleanup(self, task: dict = None) -> bool:
+        """
+        判断是否应该执行SQL清理操作
+        基于任务配置和清理频率控制
+        """
+        try:
+            # 获取当前时间
+            now = datetime.now()
+            
+            # 检查是否有清理频率配置
+            cleanup_frequency = task.get('cleanup_frequency', 'always') if task else 'always'
+            
+            if cleanup_frequency == 'never':
+                self._log_scheduler("debug", "跳过SQL清理：任务配置为从不清理")
+                return False
+            elif cleanup_frequency == 'daily':
+                # 检查是否今天已经清理过
+                last_cleanup = self._task_status.get('last_cleanup')
+                if last_cleanup:
+                    last_cleanup_time = datetime.fromisoformat(last_cleanup)
+                    if last_cleanup_time.date() == now.date():
+                        self._log_scheduler("debug", "跳过SQL清理：今天已经清理过")
+                        return False
+                # 更新最后清理时间
+                self._task_status['last_cleanup'] = now.isoformat()
+                return True
+            elif cleanup_frequency == 'weekly':
+                # 检查是否本周已经清理过
+                last_cleanup = self._task_status.get('last_cleanup')
+                if last_cleanup:
+                    last_cleanup_time = datetime.fromisoformat(last_cleanup)
+                    if last_cleanup_time.isocalendar()[1] == now.isocalendar()[1]:
+                        self._log_scheduler("debug", "跳过SQL清理：本周已经清理过")
+                        return False
+                # 更新最后清理时间
+                self._task_status['last_cleanup'] = now.isoformat()
+                return True
+            else:  # 'always' or other values
+                return True
+                
+        except Exception as e:
+            self._log_scheduler("warning", f"判断清理频率失败，默认执行清理: {str(e)}")
+            return True
 
     def _is_task_processed(self, task: dict) -> bool:
         """
@@ -2772,9 +3077,107 @@ function executeAllTasks() {
             }
         )
 
+    def _init_task_status(self, task_index: int):
+        """
+        初始化任务状态
+        """
+        task_key = f"task_{task_index}"
+        if task_key not in self._task_status:
+            self._task_status[task_key] = {
+                "last_run": None,
+                "next_run": None,
+                "success_count": 0,
+                "fail_count": 0,
+                "skip_count": 0,
+                "last_status": None,
+                "last_message": None,
+                "created_at": datetime.now().isoformat()
+            }
+            self._log_scheduler("debug", f"初始化任务状态: {task_key}")
+
+    def _update_task_status(self, task_index: int, status: dict):
+        """
+        更新任务执行状态 - 增强版本
+        """
+        task_key = f"task_{task_index}"
+        
+        # 确保任务状态存在
+        if task_key not in self._task_status:
+            self._init_task_status(task_index)
+        
+        # 记录状态变更前的值
+        old_status = self._task_status[task_key].get("last_status")
+        old_message = self._task_status[task_key].get("last_message")
+        
+        # 更新状态
+        self._task_status[task_key].update(status)
+        
+        # 记录状态变更
+        new_status = status.get("last_status")
+        new_message = status.get("last_message")
+        
+        if new_status and new_status != old_status:
+            self._log_scheduler("info", f"任务状态变更 - {task_key}: {old_status} -> {new_status}")
+        
+        # 记录详细信息
+        if status.get("last_run"):
+            log_msg = f"任务状态更新 - {task_key}: status={new_status}"
+            if new_message:
+                log_msg += f", message={new_message}"
+            if status.get("success_count"):
+                log_msg += f", success_count={status['success_count']}"
+            if status.get("fail_count"):
+                log_msg += f", fail_count={status['fail_count']}"
+            if status.get("skip_count"):
+                log_msg += f", skip_count={status['skip_count']}"
+            
+            self._log_scheduler("info", log_msg)
+            
+        # 持久化任务状态（如果支持）
+        try:
+            # 尝试将任务状态保存到系统配置中
+            from app.db.systemconfig_oper import SystemConfigOper
+            from app.schemas.types import SystemConfigKey
+            
+            system_config = SystemConfigOper()
+            status_data = {
+                "task_status": self._task_status,
+                "updated_at": datetime.now().isoformat()
+            }
+            # 使用插件特定的配置键
+            config_key = f"filescanner_task_status"
+            system_config.set(config_key, status_data)
+            self._log_scheduler("debug", f"任务状态已持久化: {config_key}")
+            
+        except Exception as e:
+            self._log_scheduler("debug", f"任务状态持久化失败（非关键错误）: {str(e)}")
+
+    def _recover_task_status(self):
+        """
+        恢复任务状态
+        """
+        try:
+            from app.db.systemconfig_oper import SystemConfigOper
+            
+            system_config = SystemConfigOper()
+            config_key = f"filescanner_task_status"
+            saved_status = system_config.get(config_key)
+            
+            if saved_status and isinstance(saved_status, dict) and "task_status" in saved_status:
+                self._task_status.update(saved_status["task_status"])
+                self._log_scheduler("info", f"成功恢复任务状态，共 {len(self._task_status)} 个任务")
+                return True
+            else:
+                self._log_scheduler("debug", "没有找到保存的任务状态")
+                return False
+                
+        except Exception as e:
+            self._log_scheduler("warning", f"恢复任务状态失败: {str(e)}")
+            return False
+
     def _init_scheduler_logger(self):
         """
-        初始化独立的调度器日志记录器
+        初始化独立的调度器日志记录器 - 增强版本
         """
         try:
             # 创建日志目录
@@ -2824,6 +3227,9 @@ function executeAllTasks() {
             self._scheduler_logger.info(f"任务数量: {len(self._tasks)}")
             self._scheduler_logger.info("=" * 60)
             
+            # 尝试恢复任务状态
+            self._recover_task_status()
+            
         except Exception as e:
             logger.error(f"初始化调度器日志记录器失败: {str(e)}")
             # 如果初始化失败，使用默认日志器
@@ -2831,40 +3237,40 @@ function executeAllTasks() {
     
     def _log_scheduler(self, level: str, message: str, **kwargs):
         """
-        记录调度器日志
+        记录调度器日志 - 增强版本
         """
         if not self._scheduler_logger:
             self._scheduler_logger = logger
             
+        # 确保日志记录器已初始化
+        if not hasattr(self, '_scheduler_logger') or not self._scheduler_logger:
+            self._scheduler_logger = logger
+            
         log_method = getattr(self._scheduler_logger, level, self._scheduler_logger.info)
-        log_method(message, **kwargs)
-    
-    def _update_task_status(self, task_index: int, status: dict):
-        """
-        更新任务执行状态
-        """
-        task_key = f"task_{task_index}"
-        if task_key not in self._task_status:
-            self._task_status[task_key] = {
-                "last_run": None,
-                "next_run": None,
-                "success_count": 0,
-                "fail_count": 0,
-                "skip_count": 0,
-                "last_status": None,
-                "last_message": None
-            }
         
-        self._task_status[task_key].update(status)
+        # 添加额外的上下文信息
+        if kwargs:
+            try:
+                import json
+                extra_info = json.dumps(kwargs, ensure_ascii=False, default=str)
+                message = f"{message} | 额外信息: {extra_info}"
+            except:
+                pass
         
-        # 记录到日志
-        if status.get("last_run"):
-            self._log_scheduler("info", f"任务状态更新 - {task_key}: {status}")
+        log_method(message)
 
     def stop_service(self):
         """
-        停止插件
+        停止插件 - 增强版本
         """
         if self._scheduler_logger:
             self._log_scheduler("info", "FileScanner 插件停止服务")
+            
+            # 持久化最终状态
+            try:
+                if hasattr(self, '_task_status') and self._task_status:
+                    self._update_task_status(0, {"last_run": datetime.now().isoformat()})
+            except:
+                pass
+            
             self._log_scheduler("info", "=" * 60)
