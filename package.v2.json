@@ -485,7 +485,7 @@
     "name": "文件扫描整理",
     "description": "定时扫描指定目录并自动整理文件到目标存储，支持转移历史清理。支持多任务独立调度，每个任务可配置独立的CRON表达式。新增独立的定时任务日志系统，提供详细的执行状态监控。提供用户友好的控制面板和真实QB种子监控功能，显示下载器中的实际种子状态。",
     "labels": "整理,定时,控制面板,下载监控,种子管理,分页显示,数据库清理,调度日志",
-    "version": "3.3",
+    "version": "3.4",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Filerun_A.png",
     "author": "penwyp",
     "level": 2,

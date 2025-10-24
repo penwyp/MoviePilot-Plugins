@@ -30,7 +30,7 @@ class FileScanner(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/penwyp/MoviePilot-Plugins/main/icons/Filerun_A.png"
     # 插件版本
-    plugin_version = "3.3"
+    plugin_version = "3.4"
     # 插件作者
     plugin_author = "penwyp"
     # 作者主页
@@ -787,14 +787,19 @@ function executeAllTasks() {
             task_cron = task.get('cron', '0 3 * * *')
             task_name = task.get('name', f'任务{idx+1}')
             
-            # 创建服务配置
+            # 创建服务配置 - 使用包装方法作为入口点
             service_info = {
                 "id": f"FileScanner_Task_{idx}",
                 "name": f"文件扫描整理 - {task_name}",
                 "trigger": CronTrigger.from_crontab(task_cron),
-                "func": self.scan_and_transfer_single_task,
-                "kwargs": {"task_index": idx}
+                "func": self.run_scheduler_job,  # 使用包装方法
+                "kwargs": {"job_id": f"FileScanner_Task_{idx}"}  # 传递 job_id 而不是 task_index
             }
+            
+            # 记录详细的服务注册信息
+            self._log_scheduler("debug", f"服务配置详情:")
+            self._log_scheduler("debug", f"  - 函数: {service_info['func'].__name__}")
+            self._log_scheduler("debug", f"  - 参数: {service_info['kwargs']}")
             
             services.append(service_info)
             
@@ -824,6 +829,26 @@ function executeAllTasks() {
         
         return services
 
+    def run_scheduler_job(self, job_id: str = None, **kwargs):
+        """
+        调度器任务入口点 - 处理通过系统API手动触发的情况
+        :param job_id: 调度器任务ID
+        :param kwargs: 其他参数
+        """
+        self._log_scheduler("info", f"调度器任务入口 - Job ID: {job_id}")
+        
+        # 从 job_id 解析任务索引
+        task_index = None
+        if job_id and job_id.startswith("FileScanner_Task_"):
+            try:
+                task_index = int(job_id.replace("FileScanner_Task_", ""))
+                self._log_scheduler("info", f"从 Job ID 解析任务索引: {task_index}")
+            except ValueError:
+                self._log_scheduler("warning", f"无法从 Job ID 解析任务索引: {job_id}")
+        
+        # 调用实际的任务执行函数
+        return self.scan_and_transfer_single_task(task_index=task_index, **kwargs)
+
     def scan_and_transfer_single_task(self, task_index: int = None, **kwargs):
         """
         执行单个扫描整理任务 - 增强版本
@@ -834,18 +859,66 @@ function executeAllTasks() {
         if not self._scheduler_logger:
             self._init_scheduler_logger()
         
-        # 记录任务触发
+        # 记录任务触发 - 增强日志
         self._log_scheduler("info", "=" * 60)
         self._log_scheduler("info", f"定时任务触发 - Task Index: {task_index}")
         self._log_scheduler("debug", f"触发参数: {kwargs}")
         self._log_scheduler("debug", f"插件状态: enabled={self._enabled}, tasks_count={len(self._tasks) if self._tasks else 0}")
         
-        # 参数验证
+        # 添加更详细的调试信息
+        try:
+            import inspect
+            frame = inspect.currentframe()
+            if frame and frame.f_back:
+                caller_info = f"调用者: {frame.f_back.f_code.co_name}"
+                self._log_scheduler("debug", f"函数调用信息: {caller_info}")
+        except Exception as e:
+            self._log_scheduler("debug", f"获取调用者信息失败: {str(e)}")
+        
+        # 处理 task_index 为 None 的情况（手动触发调度器时）
         if task_index is None:
-            error_msg = "文件扫描整理：task_index 参数不能为空"
-            logger.error(error_msg)
-            self._log_scheduler("error", error_msg)
-            return
+            self._log_scheduler("warning", "task_index 参数为空，尝试从调度器上下文获取任务信息")
+            
+            # 方法1: 尝试从当前执行的 job 中获取信息
+            try:
+                from app.scheduler import scheduler
+                
+                # 获取当前执行的 job 信息
+                current_job = None
+                for job in scheduler.get_jobs():
+                    # 检查是否是当前正在执行的 job
+                    if job.func == self.scan_and_transfer_single_task:
+                        current_job = job
+                        break
+                
+                if current_job:
+                    job_id = current_job.id
+                    self._log_scheduler("debug", f"当前 job ID: {job_id}")
+                    
+                    # 从 job ID 解析任务索引
+                    if job_id and job_id.startswith("FileScanner_Task_"):
+                        try:
+                            parsed_index = int(job_id.replace("FileScanner_Task_", ""))
+                            task_index = parsed_index
+                            self._log_scheduler("info", f"从 job ID 解析出任务索引: {task_index}")
+                        except ValueError:
+                            self._log_scheduler("warning", f"无法从 job ID 解析任务索引: {job_id}")
+                
+            except Exception as e:
+                self._log_scheduler("debug", f"尝试从调度器获取任务信息失败: {str(e)}")
+            
+            # 方法2: 如果仍然无法获取 task_index，尝试执行所有启用的任务
+            if task_index is None:
+                self._log_scheduler("warning", "无法获取任务索引，将执行所有启用的任务")
+                try:
+                    return self.scan_and_transfer_task()
+                except Exception as e:
+                    self._log_scheduler("error", f"执行所有任务失败: {str(e)}")
+                    # 如果执行所有任务也失败，返回错误信息
+                    return {
+                        "success": False,
+                        "message": f"无法获取任务索引且执行所有任务失败: {str(e)}"
+                    }
             
         # 插件状态检查
         if not self._enabled:
