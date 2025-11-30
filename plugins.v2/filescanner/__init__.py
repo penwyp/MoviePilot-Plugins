@@ -30,7 +30,7 @@ class FileScanner(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/penwyp/MoviePilot-Plugins/main/icons/Filerun_A.png"
     # 插件版本
-    plugin_version = "3.4"
+    plugin_version = "3.5"
     # 插件作者
     plugin_author = "penwyp"
     # 作者主页
@@ -1170,12 +1170,16 @@ function executeAllTasks() {
                 messages.append(f"❌ {task_name}: 存储连接失败")
                 return False
             
-            # 构建 FileItem
+            # 构建 FileItem - 根据实际路径类型设置 type
+            source_path_obj = Path(source_path)
+            file_type = "dir" if source_path_obj.is_dir() else "file"
+            self._log_scheduler("debug", f"源路径类型: {file_type} ({source_path})")
+
             fileitem = schemas.FileItem(
                 storage="local",
-                type="dir",
+                type=file_type,
                 path=source_path,
-                name=Path(source_path).name
+                name=source_path_obj.name
             )
             
             # 获取配置参数
